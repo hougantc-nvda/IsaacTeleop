@@ -142,42 +142,138 @@ jobs:
         if-no-files-found: error
         retention-days: 1
 
-  teleop-ros2-docker:
-    runs-on: ubuntu-22.04
+  test-teleop-ros2:
+    runs-on: [self-hosted, linux, gpu, "${{ matrix.arch }}"]
+    needs: build-ubuntu
+
     strategy:
-      fail-fast: false
       matrix:
-        include:
-          - ros_distro: humble
-            python_version: "3.10"
-          - ros_distro: jazzy
-            python_version: "3.12"
+        python_version: ['3.10', '3.12']
+        arch: ['x64', 'arm64']
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v6
       with:
-        fetch-depth: 0
+        submodules: recursive
 
-    - name: Setup CloudXR SDK
-      uses: ./.github/actions/setup-cloudxr-sdk
+    - name: Install uv
+      uses: ./.github/actions/setup-uv
+
+    - name: Download install artifacts
+      uses: actions/download-artifact@v7
       with:
-        ngc-cli-api-key: ${{ secrets.NGC_TELEOP_CORE_GITHUB_SERVICE_KEY }}
+        name: isaacteleop-install-release-${{ matrix.arch }}-py${{ matrix.python_version }}
+
+    - name: Extract tarball to preserve permissions
+      run: |
+        mkdir -p install
+        tar -xvf isaacteleop-install.tar -C install
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
+    - name: Set ROS Distro
+      id: ros-distro
+      run: |
+        if [ "${{ matrix.python_version }}" = "3.10" ]; then
+          echo "ROS_DISTRO=humble" >> $GITHUB_ENV
+        elif [ "${{ matrix.python_version }}" = "3.12" ]; then
+          echo "ROS_DISTRO=jazzy" >> $GITHUB_ENV
+        fi
+
     - name: Build teleop_ros2 image
       run: |
         docker build -f examples/teleop_ros2/Dockerfile \
-          --build-arg ROS_DISTRO=${{ matrix.ros_distro }} \
+          --build-arg ROS_DISTRO=${{ env.ROS_DISTRO }} \
           --build-arg PYTHON_VERSION=${{ matrix.python_version }} \
-          -t teleop_ros2_ref:${{ matrix.ros_distro }} .
+          -t teleop_ros2_ref:${{ env.ROS_DISTRO }} .
 
-    - name: Smoke test (ROS 2 + rclpy)
+    - name: Verify application modes
+      env:
+        ACCEPT_CLOUDXR_EULA: Y
+        CXR_BUILD_CONTEXT: ${{ github.workspace }}
+        PYTHON_VERSION: ${{ matrix.python_version }}
+        ISAACTELEOP_PIP_DEBUG: "0"
+        ISAACTELEOP_PIP_FIND_LINKS: /workspace/install/wheels
+        ISAACTELEOP_PIP_SPEC: isaacteleop[cloudxr]
       run: |
-        docker run --rm --entrypoint bash teleop_ros2_ref:${{ matrix.ros_distro }} -c \
-          "source /usr/local/bin/teleop-env-setup && ros2 --help > /dev/null && python3 -c \"import rclpy; rclpy.init(); rclpy.shutdown(); print('rclpy OK')\""
+        source scripts/setup_cloudxr_env.sh
+
+        PROJECT_NAME="isaacteleop-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.arch }}-${{ env.ROS_DISTRO }}"
+        LOG_FILE="/tmp/ros2_test_output_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${{ matrix.arch }}_${{ env.ROS_DISTRO }}.log"
+
+        # Cleanup
+        trap 'docker compose -p "$PROJECT_NAME" \
+          --env-file "$ENV_DEFAULT" \
+          ${ENV_LOCAL:+--env-file "$ENV_LOCAL"} \
+          -f deps/cloudxr/docker-compose.runtime.yaml \
+          -f deps/cloudxr/docker-compose.test.yaml \
+          -f deps/cloudxr/docker-compose.override.yaml \
+          down -v' EXIT
+
+        # Start CloudXR runtime
+        cat <<EOF > deps/cloudxr/docker-compose.override.yaml
+        services:
+          cloudxr-runtime:
+            container_name: "cloudxr-runtime-$PROJECT_NAME"
+        EOF
+
+        docker compose -p "$PROJECT_NAME" \
+          --env-file "$ENV_DEFAULT" \
+          ${ENV_LOCAL:+--env-file "$ENV_LOCAL"} \
+          -f deps/cloudxr/docker-compose.runtime.yaml \
+          -f deps/cloudxr/docker-compose.test.yaml \
+          -f deps/cloudxr/docker-compose.override.yaml \
+          up --build -d cloudxr-runtime
+
+        # Wait for healthy
+        healthy=false
+        for i in {1..30}; do
+          if docker compose -p "$PROJECT_NAME" \
+            --env-file "$ENV_DEFAULT" \
+            ${ENV_LOCAL:+--env-file "$ENV_LOCAL"} \
+            -f deps/cloudxr/docker-compose.runtime.yaml \
+            -f deps/cloudxr/docker-compose.test.yaml \
+            -f deps/cloudxr/docker-compose.override.yaml \
+            ps cloudxr-runtime | grep -q "healthy"; then
+            healthy=true
+            break
+          fi
+          sleep 2
+        done
+
+        if [ "$healthy" = false ]; then
+          echo "Error: CloudXR runtime failed to become healthy"
+          docker compose -p "$PROJECT_NAME" \
+            --env-file "$ENV_DEFAULT" \
+            ${ENV_LOCAL:+--env-file "$ENV_LOCAL"} \
+            -f deps/cloudxr/docker-compose.runtime.yaml \
+            -f deps/cloudxr/docker-compose.test.yaml \
+            -f deps/cloudxr/docker-compose.override.yaml \
+            logs cloudxr-runtime
+          exit 1
+        fi
+
+        # Run tests
+        for mode in controller_teleop hand_teleop controller_raw full_body; do
+          echo "Testing mode: $mode"
+          docker run --rm \
+            --gpus all \
+            --network host \
+            -v "$CXR_HOST_VOLUME_PATH:$CXR_HOST_VOLUME_PATH" \
+            -v /tmp:/tmp \
+            -e NV_CXR_RUNTIME_DIR="$CXR_HOST_VOLUME_PATH/.cloudxr/run" \
+            -e XR_RUNTIME_JSON="$CXR_HOST_VOLUME_PATH/.cloudxr/openxr_cloudxr.json" \
+            --entrypoint bash teleop_ros2_ref:${{ env.ROS_DISTRO }} -c \
+            "source /usr/local/bin/teleop-env-setup && timeout -s SIGINT 5 uv run teleop_ros2_publisher.py --ros-args -p mode:=$mode -p use_mock_operators:=true > $LOG_FILE 2>&1; rc=\$?; [ \$rc -eq 130 ] || [ \$rc -eq 124 ] || exit 1"
+
+          cat "$LOG_FILE"
+          if ! grep -q "TeleopSession started successfully" "$LOG_FILE"; then
+            echo "Error: TeleopSession never started successfully in mode $mode"
+            exit 1
+          fi
+        done
 
   test-cloudxr:
     runs-on: [self-hosted, linux, gpu, "${{ matrix.arch }}"]
@@ -226,11 +322,12 @@ jobs:
     needs:
       - build-ubuntu
       - test-cloudxr
+      - test-teleop-ros2
     outputs:
       wheel_paths: ${{ steps.upload-artifactory.outputs.wheel_paths }}
     environment: dev
     # Publish only after build and CloudXR tests succeed.
-    if: ${{ needs.build-ubuntu.result == 'success' && needs.test-cloudxr.result == 'success' }}
+    if: ${{ needs.build-ubuntu.result == 'success' && needs.test-cloudxr.result == 'success' && needs.test-teleop-ros2.result == 'success' }}
 
     steps:
     - name: Set up Python
