@@ -9,6 +9,8 @@ import shutil
 import signal
 import sys
 import threading
+import time
+from collections.abc import Callable
 
 from .env_config import get_env_config
 
@@ -16,8 +18,15 @@ from .env_config import get_env_config
 _EULA_URL = (
     "https://github.com/NVIDIA/IsaacTeleop/blob/main/deps/cloudxr/CLOUDXR_LICENSE"
 )
-_RUNTIME_JOIN_TIMEOUT = 10
-_RUNTIME_STARTUP_TIMEOUT_SEC = 10
+
+RUNTIME_STARTUP_TIMEOUT_SEC: float = 30
+"""Maximum time [s] to wait for the runtime ``runtime_started`` sentinel."""
+
+RUNTIME_TERMINATE_TIMEOUT_SEC: float = 10
+"""Timeout [s] for each escalation step (SIGTERM, then SIGKILL) when stopping the runtime."""
+
+RUNTIME_POLL_INTERVAL_SEC: float = 0.5
+"""Polling interval [s] used by :func:`wait_for_runtime_ready_sync`."""
 
 
 def _write_eula_marker(marker: str) -> None:
@@ -68,28 +77,71 @@ def _get_sdk_path() -> str | None:
 
 
 async def wait_for_runtime_ready(
-    process: multiprocessing.Process,
-    timeout_sec: float = _RUNTIME_STARTUP_TIMEOUT_SEC,
+    is_process_alive: Callable[[], bool],
+    timeout_sec: float = RUNTIME_STARTUP_TIMEOUT_SEC,
+    poll_interval_sec: float = RUNTIME_POLL_INTERVAL_SEC,
 ) -> bool:
+    """Poll for the ``runtime_started`` sentinel file.
+
+    This is the canonical implementation used by both the async callers
+    and :func:`wait_for_runtime_ready_sync`.
+
+    Args:
+        is_process_alive: Callable returning ``True`` while the
+            runtime process is still running.
+        timeout_sec: Maximum time to wait [s].
+        poll_interval_sec: Polling interval [s].
+
+    Returns:
+        ``True`` when the runtime is ready, ``False`` on timeout or
+        if the process exits early.
     """
-    Return True when runtime is ready (lock file runtime_started). Return False on timeout or if
-    the process exits early.
-    """
+    lock_file = os.path.join(get_env_config().openxr_run_dir(), "runtime_started")
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_sec
 
-    lock_file = os.path.join(get_env_config().openxr_run_dir(), "runtime_started")
-
     while loop.time() < deadline:
-        if not process.is_alive():
+        if not is_process_alive():
             return False
-
         if os.path.isfile(lock_file):
             return True
+        await asyncio.sleep(poll_interval_sec)
 
-        await asyncio.sleep(1)
+    return False
 
-    # Runtime startup timeout reached, assume the runtime is not ready
+
+def wait_for_runtime_ready_sync(
+    is_process_alive: Callable[[], bool],
+    timeout_sec: float = RUNTIME_STARTUP_TIMEOUT_SEC,
+    poll_interval_sec: float = RUNTIME_POLL_INTERVAL_SEC,
+) -> bool:
+    """Synchronous poll for the ``runtime_started`` sentinel file.
+
+    Unlike :func:`wait_for_runtime_ready`, this implementation uses
+    :func:`time.monotonic` and :func:`time.sleep` so it is safe to call
+    from threads or processes that already have a running asyncio event
+    loop (e.g. Omniverse Kit / Isaac Sim).
+
+    Args:
+        is_process_alive: Callable returning ``True`` while the
+            runtime process is still running.
+        timeout_sec: Maximum time to wait [s].
+        poll_interval_sec: Polling interval [s].
+
+    Returns:
+        ``True`` when the runtime is ready, ``False`` on timeout or
+        if the process exits early.
+    """
+    lock_file = os.path.join(get_env_config().openxr_run_dir(), "runtime_started")
+    deadline = time.monotonic() + timeout_sec
+
+    while time.monotonic() < deadline:
+        if not is_process_alive():
+            return False
+        if os.path.isfile(lock_file):
+            return True
+        time.sleep(poll_interval_sec)
+
     return False
 
 
@@ -114,13 +166,13 @@ def latest_runtime_log() -> str | None:
 
 
 def terminate_or_kill_runtime(process: multiprocessing.Process) -> None:
-    """Terminate or kill the runtime process."""
+    """Terminate or kill a :class:`multiprocessing.Process` runtime."""
     if process.is_alive():
         process.terminate()
-        process.join(timeout=_RUNTIME_JOIN_TIMEOUT)
+        process.join(timeout=RUNTIME_TERMINATE_TIMEOUT_SEC)
     if process.is_alive():
         process.kill()
-        process.join(timeout=_RUNTIME_JOIN_TIMEOUT)
+        process.join(timeout=RUNTIME_TERMINATE_TIMEOUT_SEC)
     if process.is_alive():
         raise RuntimeError("Failed to terminate or kill runtime process")
 
@@ -140,7 +192,7 @@ def _setup_openxr_dir(sdk_path: str, run_dir: str) -> str:
             raise RuntimeError(f"CloudXR SDK missing {name} at {src}. ")
         shutil.copy2(src, os.path.join(openxr_dir, name))
 
-    for stale in ("ipc_cloudxr", "runtime_started"):
+    for stale in ("ipc_cloudxr", "runtime_started", "monado.pid", "cloudxr.pid"):
         p = os.path.join(run_dir, stale)
         if os.path.exists(p):
             os.remove(p)
@@ -173,8 +225,10 @@ def run() -> None:
     prev_ld = os.environ.get("LD_LIBRARY_PATH", "")
     os.environ["LD_LIBRARY_PATH"] = sdk_path + (f":{prev_ld}" if prev_ld else "")
 
-    # By default suppress native library console output (banner, StreamSDK redirect notice), so
-    # that we can have complete control over the console output.
+    # When file-logging is active the native library writes detailed logs to
+    # NV_CXR_OUTPUT_DIR.  Suppress the console banner on stdout but redirect
+    # stderr to a file so that Vulkan-loader diagnostics, GPU-init errors,
+    # and Python tracebacks are preserved for post-mortem analysis.
     _file_logging = os.environ.get("NV_CXR_FILE_LOGGING", "yes")
     if _file_logging and _file_logging.lower() not in (
         "false",
@@ -184,10 +238,14 @@ def run() -> None:
         "f",
         "0",
     ):
+        logs_dir = cfg.ensure_logs_dir()
+        stderr_log = os.path.join(str(logs_dir), "runtime_stderr.log")
         devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        stderr_fd = os.open(stderr_log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         os.dup2(devnull_fd, sys.stdout.fileno())
-        os.dup2(devnull_fd, sys.stderr.fileno())
+        os.dup2(stderr_fd, sys.stderr.fileno())
         os.close(devnull_fd)
+        os.close(stderr_fd)
 
     lib_path = os.path.join(sdk_path, "libcloudxr.so")
     deepbind = getattr(os, "RTLD_DEEPBIND", 0)
