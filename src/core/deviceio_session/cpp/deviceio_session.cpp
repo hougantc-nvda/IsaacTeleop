@@ -1,9 +1,5 @@
-// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-
-// MCAP_IMPLEMENTATION must be defined in exactly one translation unit that
-// includes <mcap/writer.hpp>. All other TUs get declarations only.
-#define MCAP_IMPLEMENTATION
 
 #include "inc/deviceio_session/deviceio_session.hpp"
 
@@ -73,13 +69,7 @@ DeviceIOSession::DeviceIOSession(const std::vector<std::shared_ptr<ITracker>>& t
         {
             throw std::invalid_argument("DeviceIOSession: null tracker in trackers list");
         }
-        auto impl = factory.create_tracker_impl(*tracker);
-        if (!impl)
-        {
-            throw std::runtime_error("DeviceIOSession: tracker '" + std::string(tracker->get_name()) +
-                                     "' returned null impl");
-        }
-        tracker_impls_.emplace(tracker.get(), std::move(impl));
+        tracker_impls_.emplace(tracker.get(), factory.create_tracker_impl(*tracker));
     }
 }
 

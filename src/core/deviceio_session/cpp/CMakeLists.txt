@@ -1,12 +1,16 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 cmake_minimum_required(VERSION 3.20)
 
 # DeviceIOSession — wires trackers to the live factory and runs the update loop.
+# ReplaySession — reads recorded tracker data from an MCAP file.
 add_library(deviceio_session STATIC
+    mcap_impl.cpp
     deviceio_session.cpp
+    replay_session.cpp
     inc/deviceio_session/deviceio_session.hpp
+    inc/deviceio_session/replay_session.hpp
 )
 
 target_include_directories(deviceio_session
@@ -26,6 +30,7 @@ target_link_libraries(deviceio_session
     PRIVATE
         deviceio::deviceio_trackers
         deviceio::live_trackers
+        deviceio::replay_trackers
         mcap::mcap
 )
 
