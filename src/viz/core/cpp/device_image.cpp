@@ -7,11 +7,9 @@
 #include <stdexcept>
 #include <string>
 
-// Posix close() lives in <unistd.h> on Linux/macOS; Windows uses _close()
-// from <io.h>. The fd-close path is unreachable at runtime on Windows
-// (vkGetMemoryFdKHR isn't available there — import_to_cuda throws before
-// memory_fd_ is ever assigned), but the code still has to compile under
-// MSVC for the experimental Windows build.
+// Posix close() vs Windows _close() shim — the fd-close path is
+// dead on Windows (vkGetMemoryFdKHR isn't available there) but
+// still has to compile under MSVC.
 #ifdef _WIN32
 #    include <io.h>
 namespace
@@ -68,15 +66,33 @@ uint32_t find_memory_type(VkPhysicalDevice physical_device, uint32_t type_bits, 
     throw std::runtime_error("DeviceImage: no Vulkan memory type matching requested properties");
 }
 
-VkFormat to_vk_format(PixelFormat format)
+// Storage-side Vulkan format for the underlying VkImage / VkDeviceMemory.
+// We keep the storage UNORM and create a separate SRGB sampling view
+// (image is created with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) so:
+//   - CUDA writes raw bytes (no implicit gamma transform).
+//   - Vulkan samples through the SRGB view → sampler decodes
+//     sRGB -> linear.
+//   - Fragment writes linear -> sRGB encode at the attachment.
+// Net effect: arbitrary RGBA byte values round-trip exactly through
+// CUDA -> Vulkan -> readback.
+VkFormat to_vk_storage_format(PixelFormat format)
 {
     switch (format)
     {
     case PixelFormat::kRGBA8:
-        // UNORM (not SRGB) so CUDA writes round-trip without an
-        // implicit sRGB encode on the Vulkan side. Color management
-        // is the layer's concern.
         return VK_FORMAT_R8G8B8A8_UNORM;
+    case PixelFormat::kD32F:
+        return VK_FORMAT_D32_SFLOAT;
+    }
+    throw std::runtime_error("DeviceImage: unsupported PixelFormat");
+}
+
+VkFormat to_vk_view_format(PixelFormat format)
+{
+    switch (format)
+    {
+    case PixelFormat::kRGBA8:
+        return VK_FORMAT_R8G8B8A8_SRGB;
     case PixelFormat::kD32F:
         return VK_FORMAT_D32_SFLOAT;
     }
@@ -107,13 +123,21 @@ std::unique_ptr<DeviceImage> DeviceImage::create(const VkContext& ctx, Resolutio
     {
         throw std::invalid_argument("DeviceImage: resolution must be non-zero");
     }
+    if (format != PixelFormat::kRGBA8)
+    {
+        // kD32F is reserved for ProjectionLayer's depth path. The
+        // CUDA-Vulkan interop contract for a depth image (sample
+        // semantics, layout transitions, color-space view) is not
+        // worked out yet, so refuse to half-build it.
+        throw std::invalid_argument("DeviceImage: only PixelFormat::kRGBA8 is supported");
+    }
     std::unique_ptr<DeviceImage> img(new DeviceImage(ctx, resolution, format));
     img->init();
     return img;
 }
 
 DeviceImage::DeviceImage(const VkContext& ctx, Resolution resolution, PixelFormat format)
-    : ctx_(&ctx), resolution_(resolution), format_(format), vk_format_(to_vk_format(format))
+    : ctx_(&ctx), resolution_(resolution), format_(format), vk_format_(to_vk_view_format(format))
 {
 }
 
@@ -129,6 +153,7 @@ void DeviceImage::init()
         create_vk_image_with_external_memory();
         create_vk_image_view();
         import_to_cuda();
+        create_interop_semaphores();
         transition_to_shader_read();
     }
     catch (...)
@@ -140,22 +165,23 @@ void DeviceImage::init()
 
 void DeviceImage::destroy()
 {
-    // Pin CUDA device for this thread so the CUDA frees below land on
-    // the right device even if destroy() runs on a thread that never
-    // ran VkContext::init(). Best-effort — destructor must not throw.
+    // Pin CUDA device on the destroying thread (best-effort; we
+    // can't throw out of a destructor).
     if (ctx_ != nullptr && ctx_->cuda_device_id() >= 0)
     {
         (void)cudaSetDevice(ctx_->cuda_device_id());
     }
 
-    // CUDA side first; CUDA holds a dup'd handle on the underlying
-    // memory, so the VkDeviceMemory must outlive the CUDA mapping.
-    // cudaDeviceSynchronize ensures any caller-issued async CUDA work
-    // (e.g. cudaMemcpy2DToArrayAsync) has retired before we free the
-    // array — otherwise CUDA may UAF its own staging.
-    if (cuda_mipmapped_array_ != nullptr || cuda_external_memory_ != nullptr)
+    // CUDA side first — VkDeviceMemory must outlive the CUDA
+    // mapping. Sync drains any caller-issued async work first.
+    if (cuda_mipmapped_array_ != nullptr || cuda_external_memory_ != nullptr || cuda_cuda_done_writing_ != nullptr)
     {
         (void)cudaDeviceSynchronize();
+    }
+    if (cuda_cuda_done_writing_ != nullptr)
+    {
+        (void)cudaDestroyExternalSemaphore(cuda_cuda_done_writing_);
+        cuda_cuda_done_writing_ = nullptr;
     }
     if (cuda_mipmapped_array_ != nullptr)
     {
@@ -170,9 +196,8 @@ void DeviceImage::destroy()
     }
     if (memory_fd_ >= 0)
     {
-        // CUDA dups the fd internally on import, so we close our copy.
-        // If import failed before our explicit close, fd_ may still
-        // hold our copy — close it here.
+        // CUDA dup'd the fd on import; close ours. Also handles the
+        // import-failed-before-close case.
         close_fd(memory_fd_);
         memory_fd_ = -1;
     }
@@ -189,6 +214,11 @@ void DeviceImage::destroy()
     // Wait for all GPU work to retire before tearing down Vulkan
     // resources.
     (void)vkDeviceWaitIdle(device);
+    if (cuda_done_writing_ != VK_NULL_HANDLE)
+    {
+        vkDestroySemaphore(device, cuda_done_writing_, nullptr);
+        cuda_done_writing_ = VK_NULL_HANDLE;
+    }
     if (command_pool_ != VK_NULL_HANDLE)
     {
         vkDestroyCommandPool(device, command_pool_, nullptr);
@@ -212,18 +242,6 @@ void DeviceImage::destroy()
     current_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 }
 
-VizBuffer DeviceImage::view() const noexcept
-{
-    VizBuffer b;
-    b.data = static_cast<void*>(cuda_array_);
-    b.width = resolution_.width;
-    b.height = resolution_.height;
-    b.format = format_;
-    b.pitch = static_cast<size_t>(resolution_.width) * bytes_per_pixel(format_);
-    b.space = MemorySpace::kDevice;
-    return b;
-}
-
 void DeviceImage::create_vk_image_with_external_memory()
 {
     const VkDevice device = ctx_->device();
@@ -239,13 +257,16 @@ void DeviceImage::create_vk_image_with_external_memory()
     info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     info.pNext = &ext_image_info;
     info.imageType = VK_IMAGE_TYPE_2D;
-    info.format = vk_format_;
+    // Storage in linear-space format (UNORM); we'll attach the SRGB
+    // view in create_vk_image_view(). VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT
+    // is what allows view format != image format among compatible
+    // formats (UNORM <-> SRGB are in the same compatibility class).
+    info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    info.format = to_vk_storage_format(format_);
     info.extent = { resolution_.width, resolution_.height, 1 };
-    info.mipLevels = 1; // Single level — when minification moiré shows up in
-                        // XR distance views, expose mipLevels via Config and
-                        // generate the chain via vkCmdBlitImage pre-render.
-                        // Anisotropic filtering on the sampler is the cheaper
-                        // first line of defense.
+    info.mipLevels = 1; // Single level. If XR distance views show
+                        // moiré, expose mipLevels via Config and
+                        // generate via vkCmdBlitImage pre-render.
     info.arrayLayers = 1;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -258,10 +279,8 @@ void DeviceImage::create_vk_image_with_external_memory()
     VkMemoryRequirements reqs;
     vkGetImageMemoryRequirements(device, image_, &reqs);
 
-    // Memory backing the image: device-local + exportable as POSIX fd.
-    // No VkMemoryDedicatedAllocateInfo / cudaExternalMemoryDedicated —
-    // a generic allocation works for sampled 2D images and avoids the
-    // dedicated-allocation extension wiring.
+    // Device-local + exportable as POSIX fd. Generic allocation
+    // (no VkMemoryDedicatedAllocateInfo) suffices for sampled 2D.
     VkExportMemoryAllocateInfo export_info{};
     export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
     export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
@@ -314,10 +333,8 @@ void DeviceImage::create_vk_image_view()
 
 void DeviceImage::import_to_cuda()
 {
-    // cudaSetDevice is per-host-thread; VkContext set it on the init
-    // thread, but DeviceImage::create() may run on a different one.
-    // Re-pin here so cudaImportExternalMemory / GetMappedMipmappedArray
-    // talk to the same physical GPU as Vulkan.
+    // cudaSetDevice is per-host-thread; VkContext sets it on the
+    // init thread, re-pin here for worker-thread create() callers.
     check_cuda(cudaSetDevice(ctx_->cuda_device_id()), "cudaSetDevice");
 
     VkMemoryRequirements reqs;
@@ -345,6 +362,76 @@ void DeviceImage::import_to_cuda()
     check_cuda(cudaExternalMemoryGetMappedMipmappedArray(&cuda_mipmapped_array_, cuda_external_memory_, &array_desc),
                "cudaExternalMemoryGetMappedMipmappedArray");
     check_cuda(cudaGetMipmappedArrayLevel(&cuda_array_, cuda_mipmapped_array_, 0), "cudaGetMipmappedArrayLevel");
+}
+
+void DeviceImage::create_interop_semaphores()
+{
+    const VkDevice device = ctx_->device();
+
+    auto vkGetSemaphoreFdKHR =
+        reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(vkGetDeviceProcAddr(device, "vkGetSemaphoreFdKHR"));
+    if (vkGetSemaphoreFdKHR == nullptr)
+    {
+        throw std::runtime_error(
+            "DeviceImage: vkGetSemaphoreFdKHR not available "
+            "(VK_KHR_external_semaphore_fd not enabled?)");
+    }
+
+    // Timeline semaphore (initial value 0) exported via OPAQUE_FD and
+    // imported into CUDA. CUDA dups the fd internally; we close ours
+    // after the import.
+    VkSemaphoreTypeCreateInfo type_info{};
+    type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    type_info.initialValue = 0;
+
+    VkExportSemaphoreCreateInfo export_info{};
+    export_info.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
+    export_info.pNext = &type_info;
+    export_info.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+    VkSemaphoreCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    info.pNext = &export_info;
+    check_vk(vkCreateSemaphore(device, &info, nullptr, &cuda_done_writing_), "vkCreateSemaphore");
+
+    int fd = -1;
+    VkSemaphoreGetFdInfoKHR fd_info{};
+    fd_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+    fd_info.semaphore = cuda_done_writing_;
+    fd_info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+    check_vk(vkGetSemaphoreFdKHR(device, &fd_info, &fd), "vkGetSemaphoreFdKHR");
+
+    cudaExternalSemaphoreHandleDesc ext_desc{};
+    ext_desc.type = cudaExternalSemaphoreHandleTypeTimelineSemaphoreFd;
+    ext_desc.handle.fd = fd;
+    const cudaError_t err = cudaImportExternalSemaphore(&cuda_cuda_done_writing_, &ext_desc);
+    if (err != cudaSuccess)
+    {
+        close_fd(fd);
+        throw std::runtime_error(std::string("DeviceImage: cudaImportExternalSemaphore(cuda_done_writing) failed: ") +
+                                 cudaGetErrorString(err));
+    }
+    close_fd(fd);
+}
+
+void DeviceImage::cuda_signal_write_done(cudaStream_t stream)
+{
+    // Reserve, signal, commit on success. Failed signal leaves _value_
+    // at the last successfully signaled value (consumer keeps a valid
+    // wait target; failed frame is dropped). Single producer per
+    // DeviceImage → reserved is always > _value_, so a release store
+    // suffices.
+    const uint64_t reserved = cuda_done_writing_next_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    cudaExternalSemaphoreSignalParams params{};
+    params.params.fence.value = reserved;
+    const cudaError_t err = cudaSignalExternalSemaphoresAsync(&cuda_cuda_done_writing_, &params, 1, stream);
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error(std::string("DeviceImage: cudaSignalExternalSemaphoresAsync(cuda_done_writing) failed: ") +
+                                 cudaGetErrorString(err));
+    }
+    cuda_done_writing_value_.store(reserved, std::memory_order_release);
 }
 
 void DeviceImage::transition_to_shader_read()

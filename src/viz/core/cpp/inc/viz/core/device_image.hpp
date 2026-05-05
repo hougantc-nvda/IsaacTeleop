@@ -3,10 +3,12 @@
 
 #pragma once
 
-#include <viz/core/viz_buffer.hpp>
+#include <viz/core/viz_buffer.hpp> // PixelFormat — used in API signatures
 #include <viz/core/viz_types.hpp>
 #include <vulkan/vulkan.h>
 
+#include <atomic>
+#include <cstdint>
 #include <cuda_runtime.h>
 #include <memory>
 
@@ -19,12 +21,21 @@ class VkContext;
 // (optimal tiling, sampled + transfer-dst); the backing VkDeviceMemory
 // is exported via VK_KHR_external_memory_fd and imported into CUDA as
 // a cudaArray_t. CUDA writes via cuda_array(); Vulkan samples via
-// vk_image(). Symmetric counterpart to HostImage; both expose
-// VizBuffer view() so helpers branch on VizBuffer::space.
+// vk_image().
 //
-// Synchronization is heavyweight today (cudaDeviceSynchronize +
-// vkQueueWaitIdle); paired acquire / release semaphores arrive with
-// QuadLayer. CUDA/Vulkan device matching is handled by VkContext.
+// Conceptually paired with HostImage (CPU bytes vs GPU interop bytes),
+// but they don't share a view() return type: a cudaArray_t is opaque
+// tiled GPU memory and is NOT a CUDA device pointer, so wrapping it
+// as a VizBuffer would lie about that type's contract. Callers consume
+// DeviceImage via discrete accessors instead.
+//
+// Producer→consumer synchronization is one-way: a Vulkan timeline
+// semaphore exported to CUDA. CUDA increments cuda_done_writing
+// after filling; Vulkan waits for the latest known value before
+// sampling. The reverse direction is the producer's problem to solve
+// at a higher level (e.g. QuadLayer's mailbox owns enough buffers
+// that producer writes never collide with in-flight Vulkan reads).
+// CUDA / Vulkan device matching is handled by VkContext.
 class DeviceImage
 {
 public:
@@ -39,11 +50,6 @@ public:
     DeviceImage& operator=(const DeviceImage&) = delete;
     DeviceImage(DeviceImage&&) = delete;
     DeviceImage& operator=(DeviceImage&&) = delete;
-
-    // VizBuffer view (kDevice). `data` is the cudaArray_t cast to
-    // void*; it's an opaque CUDA handle, not a raw device pointer —
-    // use cuda_array() with cudaMemcpy2DToArrayAsync to write.
-    VizBuffer view() const noexcept;
 
     // CUDA write target. Lifetime tied to this DeviceImage.
     cudaArray_t cuda_array() const noexcept
@@ -65,6 +71,29 @@ public:
     {
         return vk_format_;
     }
+
+    // Timeline semaphore handle. Vulkan waits on this with the
+    // value returned by cuda_done_writing_value() before sampling.
+    VkSemaphore cuda_done_writing() const noexcept
+    {
+        return cuda_done_writing_;
+    }
+
+    // Latest value CUDA has signaled successfully. Vulkan uses this
+    // as the wait target. Advanced by cuda_signal_write_done() only
+    // after the underlying cudaSignalExternalSemaphoresAsync returns
+    // success, so a failed signal never poisons the timeline.
+    uint64_t cuda_done_writing_value() const noexcept
+    {
+        return cuda_done_writing_value_.load(std::memory_order_acquire);
+    }
+
+    // CUDA-side primitive. Reserves the next monotonic value, queues
+    // the signal on `stream`, and commits the value on success.
+    // Throws std::runtime_error on cuda*Async failure; failure leaves
+    // the public counter un-advanced so the next call is consistent
+    // with the GPU's actual semaphore state.
+    void cuda_signal_write_done(cudaStream_t stream);
 
     Resolution resolution() const noexcept
     {
@@ -88,6 +117,7 @@ private:
     void create_vk_image_with_external_memory();
     void create_vk_image_view();
     void import_to_cuda();
+    void create_interop_semaphores();
 
     void run_one_shot_layout_transition(VkImageLayout old_layout,
                                         VkImageLayout new_layout,
@@ -113,6 +143,16 @@ private:
     cudaExternalMemory_t cuda_external_memory_ = nullptr;
     cudaMipmappedArray_t cuda_mipmapped_array_ = nullptr;
     cudaArray_t cuda_array_ = nullptr; // Level-0 view, non-owning.
+
+    // Producer→consumer timeline semaphore exported via
+    // VK_KHR_external_semaphore_fd and imported into CUDA. Two atomic
+    // counters (next reservation, last committed) so a failed
+    // cudaSignal can't leave the public value pointing at something
+    // that was never signaled.
+    VkSemaphore cuda_done_writing_ = VK_NULL_HANDLE;
+    cudaExternalSemaphore_t cuda_cuda_done_writing_ = nullptr;
+    std::atomic<uint64_t> cuda_done_writing_next_{ 0 };
+    std::atomic<uint64_t> cuda_done_writing_value_{ 0 };
 };
 
 } // namespace viz

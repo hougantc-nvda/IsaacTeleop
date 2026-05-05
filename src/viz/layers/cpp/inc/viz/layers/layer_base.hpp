@@ -51,6 +51,30 @@ public:
     //           draws into; const so layers cannot modify the target.
     virtual void record(VkCommandBuffer cmd, const std::vector<ViewInfo>& views, const RenderTarget& target) = 0;
 
+    // Per-frame wait wiring for layers that synchronize against CUDA
+    // (or other external) producers via a Vulkan timeline semaphore.
+    // VizCompositor concatenates these across all visible layers and
+    // feeds them into vkQueueSubmit (with a chained
+    // VkTimelineSemaphoreSubmitInfo for the values).
+    // Default: empty (no external sync).
+    //
+    // No signal semaphores: layers that need producer↔consumer
+    // ping-pong solve it at the layer level (e.g. QuadLayer's mailbox
+    // owns enough buffers that producer writes never collide with
+    // in-flight Vulkan reads, so the compositor never has to signal
+    // back to the producer).
+    struct WaitSemaphore
+    {
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+        uint64_t value = 0;
+        VkPipelineStageFlags wait_stage = 0;
+    };
+
+    virtual std::vector<WaitSemaphore> get_wait_semaphores() const
+    {
+        return {};
+    }
+
     const std::string& name() const noexcept;
 
     // Visibility flag is atomic so it can be toggled from any thread (UI

@@ -9,26 +9,76 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <cuda_runtime.h>
+#include <vector>
 
 namespace viz::testing
 {
 
-// True iff a Televiz-suitable Vulkan device is reachable. Cached after
-// the first call. [gpu] tests should SKIP when this is false so CI
-// runners without a suitable GPU report skipped rather than failed.
+// True iff at least one GPU is reachable from BOTH Vulkan AND CUDA
+// with matching UUIDs — the same constraint VkContext::init() enforces.
+// [gpu] tests SKIP when this returns false so CI runners without a
+// suitable GPU report skipped rather than failed. Cached after the
+// first call.
 inline bool is_gpu_available()
 {
     static const bool cached = []() -> bool
     {
-        const auto devices = viz::VkContext::enumerate_physical_devices();
-        for (const auto& info : devices)
+        VkApplicationInfo app{};
+        app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+        app.apiVersion = VK_API_VERSION_1_2;
+        VkInstanceCreateInfo ic{};
+        ic.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        ic.pApplicationInfo = &app;
+        VkInstance instance = VK_NULL_HANDLE;
+        if (vkCreateInstance(&ic, nullptr, &instance) != VK_SUCCESS)
         {
-            if (info.meets_requirements)
+            return false;
+        }
+        uint32_t count = 0;
+        vkEnumeratePhysicalDevices(instance, &count, nullptr);
+        std::vector<VkPhysicalDevice> devs(count);
+        if (count > 0)
+        {
+            vkEnumeratePhysicalDevices(instance, &count, devs.data());
+        }
+
+        int cuda_count = 0;
+        if (cudaGetDeviceCount(&cuda_count) != cudaSuccess)
+        {
+            cuda_count = 0;
+        }
+
+        bool match = false;
+        for (VkPhysicalDevice vk_dev : devs)
+        {
+            VkPhysicalDeviceIDProperties id{};
+            id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+            VkPhysicalDeviceProperties2 p2{};
+            p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            p2.pNext = &id;
+            vkGetPhysicalDeviceProperties2(vk_dev, &p2);
+            for (int ci = 0; ci < cuda_count; ++ci)
             {
-                return true;
+                cudaDeviceProp prop{};
+                if (cudaGetDeviceProperties(&prop, ci) != cudaSuccess)
+                {
+                    continue;
+                }
+                if (std::memcmp(prop.uuid.bytes, id.deviceUUID, VK_UUID_SIZE) == 0)
+                {
+                    match = true;
+                    break;
+                }
+            }
+            if (match)
+            {
+                break;
             }
         }
-        return false;
+        vkDestroyInstance(instance, nullptr);
+        return match;
     }();
     return cached;
 }

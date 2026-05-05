@@ -205,15 +205,27 @@ void VizCompositor::render(const std::vector<LayerBase*>& layers, const std::vec
     rp.clearValueCount = static_cast<uint32_t>(clears.size());
     rp.pClearValues = clears.data();
 
-    vkCmdBeginRenderPass(command_buffer_, &rp, VK_SUBPASS_CONTENTS_INLINE);
-
-    // Layer dispatch: insertion order; skip invisible.
+    // Snapshot the visible-layer set ONCE per frame. is_visible() is
+    // an atomic flag; sampling it twice across record / wait-collect
+    // would let a mid-frame toggle record draws but skip the
+    // matching cuda_done_writing wait (or vice versa), which would
+    // race the producer's CUDA copy.
+    std::vector<LayerBase*> visible_layers;
+    visible_layers.reserve(layers.size());
     for (LayerBase* layer : layers)
     {
         if (layer != nullptr && layer->is_visible())
         {
-            layer->record(command_buffer_, views, *render_target_);
+            visible_layers.push_back(layer);
         }
+    }
+
+    vkCmdBeginRenderPass(command_buffer_, &rp, VK_SUBPASS_CONTENTS_INLINE);
+
+    // Layer dispatch: insertion order, only the snapshotted visible set.
+    for (LayerBase* layer : visible_layers)
+    {
+        layer->record(command_buffer_, views, *render_target_);
     }
 
     vkCmdEndRenderPass(command_buffer_);
@@ -225,16 +237,46 @@ void VizCompositor::render(const std::vector<LayerBase*>& layers, const std::vec
     // frame and the next render() doesn't deadlock on wait().
     frame_sync_->reset();
 
+    // Collect layer-provided wait timeline semaphores. Each visible
+    // layer contributes; flatten into the arrays vkQueueSubmit
+    // expects (with a chained VkTimelineSemaphoreSubmitInfo for the
+    // per-semaphore counter values).
+    std::vector<VkSemaphore> wait_semaphores;
+    std::vector<uint64_t> wait_values;
+    std::vector<VkPipelineStageFlags> wait_stages;
+    for (LayerBase* layer : visible_layers)
+    {
+        for (const auto& w : layer->get_wait_semaphores())
+        {
+            if (w.semaphore != VK_NULL_HANDLE)
+            {
+                wait_semaphores.push_back(w.semaphore);
+                wait_values.push_back(w.value);
+                wait_stages.push_back(w.wait_stage);
+            }
+        }
+    }
+
+    VkTimelineSemaphoreSubmitInfo timeline{};
+    timeline.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    timeline.waitSemaphoreValueCount = static_cast<uint32_t>(wait_values.size());
+    timeline.pWaitSemaphoreValues = wait_values.empty() ? nullptr : wait_values.data();
+
     VkSubmitInfo submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.pNext = &timeline;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &command_buffer_;
+    submit.waitSemaphoreCount = static_cast<uint32_t>(wait_semaphores.size());
+    submit.pWaitSemaphores = wait_semaphores.empty() ? nullptr : wait_semaphores.data();
+    submit.pWaitDstStageMask = wait_stages.empty() ? nullptr : wait_stages.data();
     submit_or_signal_fence(submit, "vkQueueSubmit");
 
     // Wait for completion before returning so readback / next frame sees
     // a consistent state. With 1 frame in flight this is the natural
     // synchronization point; multi-buffered swapchain rendering moves
-    // this wait to the start of the next frame.
+    // this wait to the start of the next frame. QuadLayer's mailbox
+    // depends on this — see quad_layer.hpp.
     frame_sync_->wait();
 }
 
