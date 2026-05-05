@@ -308,6 +308,8 @@ class TeleopSession:
                 leaf nodes that require caller-provided inputs. Use get_external_input_specs()
                 to discover what external inputs are expected. Keys that do not correspond
                 to an external leaf node or a DeviceIO source name are silently ignored.
+                Within each external leaf, keys not declared by that leaf's input_spec()
+                are silently ignored.
                 Keys that collide with a DeviceIO source name are invalid and cause
                 validation to raise.
             graph_time: Optional ``GraphTime`` for this step. When omitted,
@@ -366,14 +368,14 @@ class TeleopSession:
 
         The whole-step worker polls DeviceIO itself, so only explicit
         ``external_inputs`` cross the thread boundary. Those inputs, along with
-        optional graph time and explicit execution events, are copied here so
-        the application can safely reuse or mutate its objects after ``step()``
+        optional graph time and explicit execution events, are filtered to the
+        external leaf specs before optionally being copied here so the
+        application can safely reuse or mutate its objects after ``step()``
         returns. Sync mode disables the snapshot and uses this same request
         shape only to avoid duplicating the step execution path.
         """
         self._validate_external_inputs(external_inputs)
-        if snapshot_external_inputs:
-            external_inputs = self._filter_external_inputs(external_inputs)
+        external_inputs = self._filter_external_inputs(external_inputs)
         request_external_inputs = None
         if external_inputs:
             request_external_inputs = (
@@ -780,11 +782,9 @@ class TeleopSession:
     ) -> Optional[Dict[str, RetargeterIO]]:
         """Drop allowed-but-unused external leaf names and per-leaf input keys.
 
-        The public API has historically ignored extra external leaf names. In
-        pipelined mode this filtering matters because snapshotting an ignored
-        value could fail or waste work even though the pipeline will never read
-        it. The same rule applies inside a valid leaf dict: keep required input
-        names, ignore extras.
+        The public API has historically ignored extra external leaf names. This
+        filtering also keeps sync and pipelined mode aligned when callers pass
+        extra per-leaf values. Keep required input names, ignore extras.
         """
         if not external_inputs:
             return None

@@ -330,8 +330,9 @@ Methods
   ``graph_time`` can be provided explicitly; when omitted, monotonic time is used
   for both sim/real time. If ``execution_events`` is provided, it is injected into
   ``ComputeContext`` and ``teleop_control_pipeline`` is skipped for that step.
-  Raises ``ValueError`` if required external inputs are missing or collide with
-  DeviceIO source names.
+  Extra top-level external inputs and extra per-leaf keys are ignored. Raises
+  ``ValueError`` if required external inputs are missing or collide with DeviceIO
+  source names.
 - ``get_external_input_specs() -> Dict[str, RetargeterIOType]`` -- Return the
   input specifications for all external (non-DeviceIO) leaf nodes that require
   caller-provided inputs in ``step()``.

@@ -1351,6 +1351,35 @@ class TestStep:
                 # The pipeline should receive the external inputs
                 assert "sim_state" in pipeline.last_inputs
 
+    def test_default_sync_step_filters_unused_external_inputs(self):
+        """Default sync mode should ignore unused external leaves and per-leaf keys."""
+        ext = MockExternalRetargeter("sim_state")
+        pipeline = MockPipeline(leaf_nodes=[ext])
+
+        config = TeleopSessionConfig(
+            app_name="TestApp",
+            pipeline=pipeline,
+            verbose=False,
+        )
+        external_value = MagicMock()
+        external_data = {
+            "sim_state": {
+                "external_data": external_value,
+                "ignored_data": MagicMock(),
+            },
+            "bonus_data": {"external_data": MagicMock()},
+        }
+        with mock_session_dependencies():
+            session = TeleopSession(config)
+            with session:
+                session.step(external_inputs=external_data)
+
+                assert set(pipeline.last_inputs) == {"sim_state"}
+                assert set(pipeline.last_inputs["sim_state"]) == {"external_data"}
+                assert (
+                    pipeline.last_inputs["sim_state"]["external_data"] is external_value
+                )
+
     def test_step_with_mixed_sources(self):
         """step() with both DeviceIO sources and external inputs."""
         head = MockHeadSource()
