@@ -95,6 +95,11 @@ public:
         return resolution_;
     }
 
+    // Recreate color/depth/framebuffer at new_size. Keeps the render
+    // pass alive; pipelines built against it stay valid. Caller must
+    // ensure GPU work is retired (vkDeviceWaitIdle / fence wait).
+    void resize(Resolution new_size);
+
 private:
     explicit RenderTarget(const VkContext& ctx);
 
@@ -104,6 +109,7 @@ private:
     void create_depth_image(const Config& config);
     void create_render_pass();
     void create_framebuffer();
+    void destroy_attachments(); // images + views + memory + framebuffer
 
     const VkContext* ctx_ = nullptr;
 

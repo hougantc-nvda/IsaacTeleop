@@ -7,6 +7,7 @@
 #include <viz/core/viz_types.hpp>
 #include <viz/core/vk_context.hpp>
 #include <viz/layers/layer_base.hpp>
+#include <viz/session/display_mode.hpp>
 #include <viz/session/frame_info.hpp>
 #include <viz/session/viz_compositor.hpp>
 
@@ -19,17 +20,7 @@
 namespace viz
 {
 
-// Display backend selection at session creation time.
-//
-// kOffscreen is the only mode implemented today; readback_to_host() is
-// the primary output. kWindow (GLFW) and kXr (OpenXR + CloudXR) ship
-// with the window-mode and XR-mode milestones respectively.
-enum class DisplayMode
-{
-    kOffscreen,
-    kWindow,
-    kXr,
-};
+class DisplayBackend;
 
 // Lifecycle states for a VizSession. The full set covers XR; window /
 // offscreen modes only transition through:
@@ -76,9 +67,14 @@ public:
         // Layers render on top of this. Defaults to opaque black.
         float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
 
-        // Optional pre-built Vulkan context. If null, the session creates
-        // its own VkContext. Pass an externally-owned ctx (heap or static)
-        // when sharing the device with another component.
+        // Optional pre-built Vulkan context. If null, the session
+        // creates its own VkContext. The caller-supplied context
+        // MUST already have the backend's required extensions
+        // enabled — VK_KHR_swapchain (+ surface extensions) for
+        // kWindow, OpenXR-Vulkan extensions for kXr. VizSession does
+        // NOT retroactively enable them; backend init will fail late
+        // if they're missing. The physical device must also support
+        // present on the eventual surface in kWindow mode.
         VkContext* external_context = nullptr;
 
         // OpenXR instance extensions to enable beyond Televiz's required
@@ -161,18 +157,32 @@ public:
     // their own pipelines. nullptr before create() / after destroy().
     const VkContext* get_vk_context() const noexcept;
 
+    // True when the underlying display target has been asked to close
+    // (user clicked the window close button, etc.). Always false in
+    // kOffscreen / kXr. Drives application loops:
+    //   while (!session.should_close()) session.render();
+    bool should_close() const noexcept;
+
 private:
     explicit VizSession(const Config& config);
     void init();
 
     const VkContext& ctx() const noexcept;
     void update_timing_stats(float frame_time_seconds);
+    // Poll backend events + handle resize. Called by render() and
+    // begin_frame() so explicit-loop users get the same behavior.
+    void pump_events();
 
     Config config_{};
 
     // Either we own a VkContext or we hold a borrowed pointer.
     std::unique_ptr<VkContext> owned_ctx_;
     VkContext* ctx_ptr_ = nullptr;
+
+    // Display backend (picked from config_.mode at init). Owns mode-
+    // specific resources. Must outlive compositor_ (compositor holds
+    // a non-owning ref) and is destroyed before the VkContext.
+    std::unique_ptr<DisplayBackend> backend_;
 
     std::unique_ptr<VizCompositor> compositor_;
     std::vector<std::unique_ptr<LayerBase>> layers_;
